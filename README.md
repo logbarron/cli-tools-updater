@@ -2,7 +2,7 @@
 
 A simple zsh script that updates terminal tools with a spinner UI and version tracking.
 
-![updatett screenshot](assets/screenshot.webp)
+![updatett demo](assets/updatett.gif)
 
 ## What it currently does
 Updates uv, Claude CLI, Wrangler, npm packages, and any other tools you configure. 
