@@ -136,6 +136,7 @@ trap 'cleanup' EXIT
 TOOLS=(
     "uv|uv|uv --version|uv self update"
     "Claude CLI|claude|claude --version|claude update"
+    "Gemini CLI|gemini|gemini --version|npm install -g @google/gemini-cli@latest"
     "OpenAI Codex|SKIP_CHECK|npm list -g @openai/codex|npm install -g @openai/codex@latest"
     "Wrangler|wrangler|wrangler --version|npm install -g wrangler@latest"
     "Stripe Node.js|SKIP_CHECK|npm list -g stripe|npm install -g stripe@latest"
