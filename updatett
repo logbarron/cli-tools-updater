@@ -141,6 +141,7 @@ TOOLS=(
     "Wrangler|wrangler|wrangler --version|npm install -g wrangler@latest"
     "Stripe Node.js|SKIP_CHECK|npm list -g stripe|npm install -g stripe@latest"
     "Pyright|pyright|pyright --version|npm install -g pyright@latest"
+    "TypeScript LS|typescript-language-server|typescript-language-server --version|npm install -g typescript-language-server@latest typescript@latest"
 )
 
 # ═══════════════════════════════════════════════════════════════
