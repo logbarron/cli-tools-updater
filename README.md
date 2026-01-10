@@ -2,7 +2,7 @@
 
 A simple zsh script that updates terminal tools with a spinner UI and version tracking.
 
-![updatett demo](assets/updatett.gif)
+![updatett demo](assets/updatett-demo.gif)
 ## Currently
 Updates uv, Claude CLI, Gemini CLI, Codex, Wrangler, Stripe js, Pyright, TypeScript LS. Shows before/after versions and skips tools that are already up to date. 
 
