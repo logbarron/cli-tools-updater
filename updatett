@@ -4,6 +4,10 @@
 
 set -uo pipefail
 
+# Source nvm if available (zsh -f skips startup files, so nvm must be loaded explicitly)
+export NVM_DIR="$HOME/.nvm"
+[[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" && nvm use node --silent >/dev/null 2>&1
+
 # Use TMPDIR if set, otherwise fallback to /tmp
 : "${TMPDIR:=/tmp}"
 
@@ -139,7 +143,6 @@ TOOLS=(
     "Gemini CLI|gemini|gemini --version|npm install -g @google/gemini-cli@latest"
     "OpenAI Codex|SKIP_CHECK|npm list -g @openai/codex|npm install -g @openai/codex@latest"
     "Wrangler|wrangler|wrangler --version|npm install -g wrangler@latest"
-    "Stripe Node.js|SKIP_CHECK|npm list -g stripe|npm install -g stripe@latest"
     "Pyright|pyright|pyright --version|npm install -g pyright@latest"
     "TypeScript LS|typescript-language-server|typescript-language-server --version|npm install -g typescript-language-server@latest typescript@latest"
 )
@@ -180,11 +183,6 @@ get_version() {
     if [[ $cmd == *"npm list -g @openai/codex"* ]]; then
         local version
         version=$(npm list -g --depth=0 @openai/codex 2>/dev/null | grep '@openai/codex@' | grep -Eo '[0-9]+(\.[0-9]+){1,3}(-[A-Za-z0-9._-]+)?' | head -n1)
-        print -r -- "$version"
-        return
-    elif [[ $cmd == *"npm list -g stripe"* ]]; then
-        local version
-        version=$(npm list -g --depth=0 stripe 2>/dev/null | grep ' stripe@' | grep -Eo '[0-9]+(\.[0-9]+){1,3}(-[A-Za-z0-9._-]+)?' | head -n1)
         print -r -- "$version"
         return
     fi
