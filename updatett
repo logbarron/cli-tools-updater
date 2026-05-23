@@ -207,13 +207,14 @@ get_version() {
 }
 
 get_latest_1password_cli_version() {
+    local channel="${1:-stable}"
     local url="https://app-updates.agilebits.com/product_history/CLI2"
     local page
 
     command -v curl >/dev/null 2>&1 || return 1
     page=$(curl -fsSL "$url" 2>/dev/null) || return 1
 
-    awk '
+    awk -v channel="$channel" '
         /<article / {
             in_article = 1
             is_beta = ($0 ~ /class=.beta/)
@@ -224,7 +225,7 @@ get_latest_1password_cli_version() {
             is_beta = 0
             next
         }
-        in_article && !is_beta && /^[[:space:]]*[0-9]+(\.[0-9]+){2,3}[[:space:]]*$/ {
+        in_article && ((channel == "beta" && is_beta) || (channel != "beta" && !is_beta)) && /^[[:space:]]*[0-9]+(\.[0-9]+){2,3}(-[A-Za-z0-9._-]+)?[[:space:]]*$/ {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
             print
             exit
@@ -237,7 +238,10 @@ get_latest_version() {
 
     case "$checker" in
         1password-cli)
-            get_latest_1password_cli_version
+            get_latest_1password_cli_version stable
+            ;;
+        1password-cli-beta)
+            get_latest_1password_cli_version beta
             ;;
         *)
             return 1
@@ -246,13 +250,21 @@ get_latest_version() {
 }
 
 compare_versions() {
-    local left="${1%%-*}"
-    local right="${2%%-*}"
-    local -a left_parts right_parts
+    local left="$1"
+    local right="$2"
+    local left_base="${left%%-*}"
+    local right_base="${right%%-*}"
+    local left_pre=""
+    local right_pre=""
+    local -a left_parts right_parts left_pre_parts right_pre_parts
     local max i left_part right_part
+    local left_is_number right_is_number
 
-    left_parts=("${(@s:.:)left}")
-    right_parts=("${(@s:.:)right}")
+    [[ "$left" == *-* ]] && left_pre="${left#*-}"
+    [[ "$right" == *-* ]] && right_pre="${right#*-}"
+
+    left_parts=("${(@s:.:)left_base}")
+    right_parts=("${(@s:.:)right_base}")
     max=${#left_parts[@]}
     (( ${#right_parts[@]} > max )) && max=${#right_parts[@]}
 
@@ -271,15 +283,78 @@ compare_versions() {
         fi
     done
 
+    if [[ -z "$left_pre" && -z "$right_pre" ]]; then
+        print -r -- "0"
+        return 0
+    elif [[ -z "$left_pre" ]]; then
+        print -r -- "1"
+        return 0
+    elif [[ -z "$right_pre" ]]; then
+        print -r -- "-1"
+        return 0
+    fi
+
+    left_pre_parts=("${(@s:.:)left_pre}")
+    right_pre_parts=("${(@s:.:)right_pre}")
+    max=${#left_pre_parts[@]}
+    (( ${#right_pre_parts[@]} > max )) && max=${#right_pre_parts[@]}
+
+    for ((i = 1; i <= max; i++)); do
+        left_part="${left_pre_parts[i]:-}"
+        right_part="${right_pre_parts[i]:-}"
+
+        if [[ -z "$left_part" && -n "$right_part" ]]; then
+            print -r -- "-1"
+            return 0
+        elif [[ -n "$left_part" && -z "$right_part" ]]; then
+            print -r -- "1"
+            return 0
+        fi
+
+        left_is_number=0
+        right_is_number=0
+        [[ "$left_part" == <-> ]] && left_is_number=1
+        [[ "$right_part" == <-> ]] && right_is_number=1
+
+        if (( left_is_number && right_is_number )); then
+            if (( 10#$left_part > 10#$right_part )); then
+                print -r -- "1"
+                return 0
+            elif (( 10#$left_part < 10#$right_part )); then
+                print -r -- "-1"
+                return 0
+            fi
+        elif (( left_is_number )); then
+            print -r -- "-1"
+            return 0
+        elif (( right_is_number )); then
+            print -r -- "1"
+            return 0
+        elif [[ "$left_part" > "$right_part" ]]; then
+            print -r -- "1"
+            return 0
+        elif [[ "$left_part" < "$right_part" ]]; then
+            print -r -- "-1"
+            return 0
+        fi
+    done
+
     print -r -- "0"
 }
 
 check_latest_only() {
     local checker=$1
     local current_version=$2
-    local latest_version compare_result
+    local latest_version compare_result selected_checker status_scope
 
-    latest_version=$(get_latest_version "$checker") || latest_version=""
+    selected_checker="$checker"
+    status_scope=""
+    if [[ "$checker" == "1password-cli" && "$current_version" == *-* ]]; then
+        selected_checker="1password-cli-beta"
+        status_scope=" beta"
+    fi
+
+    latest_version=$(get_latest_version "$selected_checker") || latest_version=""
     if [[ -z "$latest_version" ]]; then
         printf "${YELLOW}${SKIP}${NC} ${DIM}(latest check unavailable)${NC}\n"
         return 0
@@ -293,13 +368,13 @@ check_latest_only() {
     compare_result=$(compare_versions "$current_version" "$latest_version")
     case "$compare_result" in
         0)
-            printf "${GREEN}${CHECK}${NC} ${DIM}(already latest)${NC}\n"
+            printf "${GREEN}${CHECK}${NC} ${DIM}(already latest%s)${NC}\n" "$status_scope"
             ;;
         -1)
-            printf "${ARROW} ${YELLOW}%s${NC} ${YELLOW}${SKIP}${NC} ${DIM}(manual update required)${NC}\n" "$latest_version"
+            printf "${ARROW} ${YELLOW}%s${NC} ${YELLOW}${SKIP}${NC} ${DIM}(manual%s update required)${NC}\n" "$latest_version" "$status_scope"
             ;;
         1)
-            printf "${GREEN}${CHECK}${NC} ${DIM}(newer than latest listed: %s)${NC}\n" "$latest_version"
+            printf "${GREEN}${CHECK}${NC} ${DIM}(newer than latest%s listed: %s)${NC}\n" "$status_scope" "$latest_version"
             ;;
     esac
 }

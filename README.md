@@ -51,3 +51,5 @@ If the tool can be checked but needs a manual install to update, use CHECK_ONLY:
 ```
 "1Password CLI|op|op --version|CHECK_ONLY:1password-cli"
 ```
+
+The 1Password checker is channel-aware: stable installs compare against the latest stable release, and beta installs compare against the latest beta release.
