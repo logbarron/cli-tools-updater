@@ -48,6 +48,10 @@ cleanup() {
         fi
         rm -rf -- "$temp_dir"
     fi
+    # nvm normally retains downloaded Node installers, even after uninstalling.
+    if command -v nvm >/dev/null 2>&1; then
+        nvm cache clear >/dev/null 2>&1 || print -ru2 -- 'Could not clear the Node installer cache.'
+    fi
     return "$code"
 }
 trap 'exit 130' INT
@@ -56,11 +60,13 @@ trap 'cleanup' EXIT
 
 # Wrangler belongs to the default nvm environment, not whichever Node happens
 # to be newest. Native CLIs and uv tools take precedence over app-bundled tools.
-node_ready=1
+node_ready=0
 export NVM_DIR="${NVM_DIR:-${XDG_CONFIG_HOME:+$XDG_CONFIG_HOME/nvm}}"
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+export npm_config_logs_max=0 npm_config_fund=false npm_config_engine_strict=true
+export npm_config_allow_scripts=esbuild,workerd,fsevents npm_config_strict_allow_scripts=true
 if [[ -s "$NVM_DIR/nvm.sh" ]]; then
-    source "$NVM_DIR/nvm.sh" --no-use && nvm use default --silent >/dev/null 2>&1 || node_ready=0
+    source "$NVM_DIR/nvm.sh" --no-use && nvm use default --silent >/dev/null 2>&1 && node_ready=1
 fi
 export PATH="$HOME/.local/bin:$PATH"
 # Wrangler writes debug files even for --version unless explicitly disabled.
@@ -68,9 +74,9 @@ export WRANGLER_WRITE_LOGS=0
 
 is_tty=0
 [[ -t 1 ]] && is_tty=1
-green='' red='' yellow='' dim='' reset=''
+green='' red='' dim='' reset=''
 if (( is_tty )) && [[ -z "${NO_COLOR:-}" ]]; then
-    green=$'\e[32m'; red=$'\e[31m'; yellow=$'\e[33m'
+    green=$'\e[32m'; red=$'\e[31m'
     dim=$'\e[2m'; reset=$'\e[0m'
 fi
 frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
@@ -104,6 +110,13 @@ run_quiet() {
     return "$result"
 }
 
+refresh_environment() {
+    [[ "$1" != nvm ]] || source "$NVM_DIR/nvm.sh" --no-use || return 1
+    if [[ "$1" == nvm || "$1" == node ]]; then
+        nvm use default --silent >/dev/null 2>&1 || return 1
+    fi
+}
+
 update_tool() {
     local name=$1 binary=$2 before after code
     shift 2
@@ -114,10 +127,10 @@ update_tool() {
     fi
     before=$(version "$binary") || before='unknown'
     row=$(printf '%-18s %s' "$name" "$before")
-    if [[ "$binary" == wrangler && "$node_ready" == 0 ]]; then
+    if [[ "$binary" == (node|npm|wrangler) && "$node_ready" == 0 ]]; then
         printf '%s %s✗ default Node unavailable%s\n' "$row" "$red" "$reset"
         (( failures++ ))
-    elif run_quiet "$@"; then
+    elif run_quiet "$@" && refresh_environment "$binary"; then
         after=$(version "$binary") || after=''
         if [[ -z "$after" ]]; then
             printf '%s %s✗ version check failed%s\n' "$row" "$red" "$reset"
@@ -129,10 +142,54 @@ update_tool() {
         fi
     else
         code=$?
-        printf '%s %s✗ update failed (exit %s)%s\n' "$row" "$red" "$code" "$reset"
+        if [[ "$binary" == node && "$code" == 75 ]]; then
+            printf '%s %s✗ Node environment in use; retry when it is idle%s\n' "$row" "$red" "$reset"
+        else
+            printf '%s %s✗ update failed (exit %s)%s\n' "$row" "$red" "$code" "$reset"
+        fi
+        [[ "$binary" != node ]] || node_ready=0
         (( failures++ ))
     fi
     return 0
+}
+
+update_nvm() {
+    local release
+    git -C "$NVM_DIR" diff --quiet && git -C "$NVM_DIR" diff --cached --quiet || return 1
+    git -C "$NVM_DIR" fetch --tags origin || return 1
+    for release in ${(f)"$(git -C "$NVM_DIR" tag --list 'v[0-9]*' --sort=-version:refname)"}; do
+        if [[ "$release" =~ '^v[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
+            git -C "$NVM_DIR" checkout "$release"
+            return $?
+        fi
+    done
+    return 1
+}
+
+update_node() {
+    local previous target previous_path target_path manifest module
+    previous=$(nvm version default) || return 1
+    target=$(nvm version-remote --lts) || return 1
+    [[ "$previous" =~ '^v[0-9]+\.[0-9]+\.[0-9]+$' && "$target" =~ '^v[0-9]+\.[0-9]+\.[0-9]+$' ]] || return 1
+    [[ "$previous" != "$target" ]] || return 0
+    previous_path="$NVM_DIR/versions/node/$previous"
+    target_path="$NVM_DIR/versions/node/$target"
+    pgrep -u "$UID" -f "$previous_path/" >/dev/null && return 75
+    # Explicit migration also works when a failed earlier run installed target.
+    nvm install -b --no-progress "$target" --latest-npm || return 1
+    nvm reinstall-packages "$previous" || return 1
+    for manifest in "$previous_path"/lib/node_modules/{*,@*/*}/package.json(N); do
+        module=${manifest#"$previous_path/lib/node_modules/"}
+        [[ "$module" == (npm|corepack)/package.json ]] && continue
+        [[ -f "$target_path/lib/node_modules/$module" ]] || return 1
+    done
+    [[ "v$(version "$target_path/bin/node")" == "$target" ]] || return 1
+    npm list -g --depth=0 >/dev/null || return 1
+    if [[ -e "$previous_path/bin/wrangler" ]]; then
+        version "$target_path/bin/wrangler" >/dev/null || return 1
+    fi
+    pgrep -u "$UID" -f "$previous_path/" >/dev/null && return 75
+    nvm alias default "$target" && nvm uninstall "$previous"
 }
 
 install_1password() {
@@ -182,6 +239,9 @@ update_tool Ruff ruff uv tool upgrade ruff
 update_tool ty ty uv tool upgrade ty
 update_tool 'Claude CLI' claude claude update
 update_tool 'OpenAI Codex' codex codex update
+update_tool nvm nvm update_nvm
+update_tool 'Node.js (LTS)' node update_node
+update_tool npm npm nvm install-latest-npm
 update_tool Wrangler wrangler npm install -g wrangler@latest --allow-scripts=esbuild,workerd,fsevents --strict-allow-scripts --logs-max=0 --no-fund
 op_target=$(command -v op) || op_target=''
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/updatett-op.XXXXXXXX") || exit 1

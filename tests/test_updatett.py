@@ -18,6 +18,8 @@ name = Path(sys.argv[0]).name
 root = Path(os.environ['TEST_ROOT'])
 args = sys.argv[1:]
 target = args[2] if name == 'uv' and args[:2] == ['tool', 'upgrade'] else name
+if name == 'npm':
+    target = 'npm' if 'npm@latest' in args else 'wrangler'
 if args == ['--version']:
     if name == 'wrangler' and os.environ.get('WRANGLER_WRITE_LOGS') != '0':
         sys.exit(23)
@@ -25,6 +27,11 @@ if args == ['--version']:
         print('unrecognized version')
     elif name == 'op':
         print(os.environ.get('TEST_NEXT_OP_VERSION', '2.40.0') if globals().get('installed') else os.environ.get('TEST_OP_VERSION', '2.39.0'))
+    elif name == 'node':
+        print(Path(sys.argv[0]).parent.parent.name)
+    elif name == 'nvm':
+        state = root / 'version-nvm'
+        print(state.read_text() if state.exists() else '0.40.3')
     else:
         state = root / ('version-' + name)
         print(state.read_text() if state.exists() else '1.0.0')
@@ -36,8 +43,47 @@ if name == 'pgrep':
         if args[-2:] == ['-x', 'op'] and os.environ.get('TEST_OP_IN_USE') == '1':
             print('999999')
             sys.exit(0)
+        if args[-2] == '-f' and '/versions/node/' in args[-1] and os.environ.get('TEST_NODE_IN_USE') == '1':
+            print('999999')
+            sys.exit(0)
         sys.exit(1)
     os.execv('/usr/bin/pgrep', ['/usr/bin/pgrep'] + args)
+if name == 'git':
+    if os.environ.get('TEST_NVM_UPDATE_FAIL') == '1':
+        sys.exit(18)
+    if 'tag' in args:
+        print('v0.41.0-beta.1\nv0.40.8\nv0.40.3')
+    if 'checkout' in args:
+        (root / 'version-nvm').write_text(args[-1].removeprefix('v'))
+    sys.exit(0)
+if name == 'nvm':
+    import shutil
+    nvm = root / 'nvm'
+    alias = nvm / 'alias/default'
+    if args[:1] == ['version']:
+        print(alias.read_text().strip() if args[1] == 'default' else args[1])
+    elif args[:1] == ['version-remote']:
+        print(os.environ.get('TEST_NEXT_NODE', 'v24.21.0'))
+    elif args[:1] == ['install']:
+        dest = nvm / 'versions/node' / args[3] / 'bin'
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / 'bin/node', dest / 'node')
+    elif args[:1] == ['reinstall-packages']:
+        if os.environ.get('TEST_MIGRATION_FAIL') != '1':
+            dest = nvm / 'versions/node' / os.environ['TEST_ACTIVE_NODE']
+            shutil.copy2(root / 'bin/wrangler', dest / 'bin/wrangler')
+            package = dest / 'lib/node_modules/wrangler'
+            package.mkdir(parents=True, exist_ok=True)
+            (package / 'package.json').write_text('{}')
+    elif args[:2] == ['alias', 'default']:
+        alias.write_text(args[2] + '\n')
+    elif args[:1] == ['uninstall']:
+        shutil.rmtree(nvm / 'versions/node' / args[1])
+    elif args[:1] == ['install-latest-npm']:
+        sys.exit(subprocess.run([str(root / 'bin/npm'), 'install', '-g', 'npm@latest'], check=False).returncode)
+    elif args[:2] == ['cache', 'clear']:
+        shutil.rmtree(nvm / '.cache', ignore_errors=True)
+    sys.exit(0)
 if name == 'pkgutil':
     if os.environ.get('TEST_BAD_PACKAGE') == '1':
         sys.exit(19)
@@ -70,7 +116,24 @@ if name == 'op':
         dest = Path(args[args.index('--directory') + 1])
         (dest / 'op.pkg').write_text('fake package')
 elif os.environ.get('TEST_UNCHANGED') != '1':
-    (root / ('version-' + ('wrangler' if name == 'npm' else target))).write_text('1.1.0')
+    (root / ('version-' + target)).write_text('1.1.0')
+"""
+
+NVM = r"""
+nvm() {
+    if [[ "$1" == use ]]; then
+        [[ "${TEST_NVM_USE_FAIL:-0}" != 1 ]] || return 3
+        local selected
+        selected=$("$TEST_ROOT/bin/nvm" version "$2") || return 1
+        export PATH="$NVM_DIR/versions/node/$selected/bin:$TEST_ROOT/bin:/usr/bin:/bin"
+        export TEST_ACTIVE_NODE="$selected"
+    elif [[ "$1" == install ]]; then
+        "$TEST_ROOT/bin/nvm" "$@" || return 1
+        nvm use "$4"
+    else
+        "$TEST_ROOT/bin/nvm" "$@"
+    fi
+}
 """
 
 
@@ -92,10 +155,27 @@ class UpdaterTests(unittest.TestCase):
             "pkgutil",
             "codesign",
             "pgrep",
+            "git",
+            "nvm",
+            "node",
         ]:
             executable = self.bin / name
             executable.write_text("#!" + sys.executable + "\n" + MOCK)
             executable.chmod(0o755)
+        nvm = self.root / "nvm"
+        (nvm / "alias").mkdir(parents=True)
+        (nvm / "alias/default").write_text("v24.21.0\n")
+        (nvm / "nvm.sh").write_text(NVM)
+        node = nvm / "versions/node/v24.21.0"
+        (node / "bin").mkdir(parents=True)
+        for name in ("node", "wrangler"):
+            executable = node / "bin" / name
+            executable.write_bytes((self.bin / name).read_bytes())
+            executable.chmod(0o755)
+        (node / "lib/node_modules/wrangler").mkdir(parents=True)
+        (node / "lib/node_modules/wrangler/package.json").write_text("{}")
+        (nvm / ".cache").mkdir()
+        (nvm / ".cache/installer.tar.xz").write_text("fake cached installer")
         # The test copy omits only the workstation PATH prepend. NVM_DIR points
         # at a fixture, so the real user startup and executables cannot run.
         source = SOURCE.read_text()
@@ -158,13 +238,14 @@ class UpdaterTests(unittest.TestCase):
         calls = self.calls()
         self.assertIn(["codex", "update"], calls)
         self.assertIn(["uv", "tool", "upgrade", "ruff"], calls)
-        npm = next(call for call in calls if call[0] == "npm")
+        npm = next(call for call in calls if "wrangler@latest" in call)
         self.assertIn("wrangler@latest", npm)
         self.assertIn("--logs-max=0", npm)
         self.assertIn("--allow-scripts=esbuild,workerd,fsevents", npm)
         self.assertIn("--strict-allow-scripts", npm)
         self.assertFalse(list(self.root.glob("*.log")))
         self.assertFalse(list(self.root.glob("updatett-op.*")))
+        self.assertFalse((self.root / "nvm/.cache").exists())
 
     def test_failure_continues_and_returns_nonzero(self):
         result = self.run_updater(TEST_FAIL="ruff")
@@ -236,15 +317,50 @@ class UpdaterTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("updatett-op.*")))
 
     def test_default_nvm_failure_does_not_use_inherited_npm(self):
-        nvm = self.root / "nvm"
-        nvm.mkdir()
-        (nvm / "nvm.sh").write_text(
-            'nvm() { [[ "$1 $2" == "use default" ]] && return 3; }\n'
-        )
-        result = self.run_updater()
+        result = self.run_updater(TEST_NVM_USE_FAIL="1")
         self.assertEqual(result.returncode, 1)
         self.assertIn("default Node unavailable", result.stdout)
         self.assertFalse(any(call[0] == "npm" for call in self.calls()))
+
+    def test_node_migration_validates_switches_and_removes_old_default(self):
+        result = self.run_updater(TEST_NEXT_NODE="v24.22.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("24.21.0 → 24.22.0", result.stdout)
+        self.assertIn("0.40.3 → 0.40.8", result.stdout)
+        nvm = self.root / "nvm"
+        self.assertEqual((nvm / "alias/default").read_text().strip(), "v24.22.0")
+        self.assertFalse((nvm / "versions/node/v24.21.0").exists())
+        self.assertTrue((nvm / "versions/node/v24.22.0/bin/wrangler").exists())
+        self.assertIn(["nvm", "reinstall-packages", "v24.21.0"], self.calls())
+        self.assertIn(["nvm", "install-latest-npm"], self.calls())
+
+    def test_failed_migration_preserves_default_and_retries_existing_target(self):
+        result = self.run_updater(TEST_NEXT_NODE="v24.22.0", TEST_MIGRATION_FAIL="1")
+        self.assertEqual(result.returncode, 1)
+        nvm = self.root / "nvm"
+        self.assertEqual((nvm / "alias/default").read_text().strip(), "v24.21.0")
+        self.assertTrue((nvm / "versions/node/v24.21.0/bin/node").exists())
+        self.assertFalse(any(call[0] == "npm" for call in self.calls()))
+        self.assertEqual(self.run_updater(TEST_NEXT_NODE="v24.22.0").returncode, 0)
+        self.assertFalse((nvm / "versions/node/v24.21.0").exists())
+
+    def test_running_node_defers_migration_and_preserves_other_versions(self):
+        nvm = self.root / "nvm"
+        other = nvm / "versions/node/v22.23.3"
+        other.mkdir()
+        result = self.run_updater(TEST_NEXT_NODE="v24.22.0", TEST_NODE_IN_USE="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Node environment in use", result.stdout)
+        self.assertTrue((nvm / "versions/node/v24.21.0/bin/node").exists())
+        self.assertFalse((nvm / "versions/node/v24.22.0").exists())
+        self.assertEqual(self.run_updater(TEST_NEXT_NODE="v24.22.0").returncode, 0)
+        self.assertTrue(other.exists())
+
+    def test_npm_failure_is_reported_and_other_tools_continue(self):
+        result = self.run_updater(TEST_FAIL="npm")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exit 17", result.stdout)
+        self.assertTrue(any(call[0] == "op" for call in self.calls()))
 
     def test_lock_excludes_concurrent_run_and_recovers_after_crash(self):
         self.start_blocked()
