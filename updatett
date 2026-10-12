@@ -1,522 +1,191 @@
 #!/usr/bin/env -S zsh -f
-#
-# updatett - Smart terminal tools updater with version tracking
-
+# Maintain this workstation's global terminal tools. No update logs are written.
 set -uo pipefail
+setopt NO_BG_NICE
 
-# Source nvm if available (zsh -f skips startup files, so nvm must be loaded explicitly)
-export NVM_DIR="$HOME/.nvm"
-[[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" && nvm use node --silent >/dev/null 2>&1
-
-# Use TMPDIR if set, otherwise fallback to /tmp
-: "${TMPDIR:=/tmp}"
-
-# --- mkdir-based locking (to prevent concurrent runs) with stale-lock handling ---
-LOCKDIR="${TMPDIR}/updatett.lock"
-PIDFILE="${LOCKDIR}/pid"
-
-ensure_lock() {
-  if mkdir "$LOCKDIR" 2>/dev/null; then
-    print -r -- "$$" >| "$PIDFILE" 2>/dev/null || true
-    return 0
-  fi
-
-  # Lockdir exists; check for stale lock
-  if [[ -d "$LOCKDIR" ]]; then
-    local oldpid=""
-    [[ -f "$PIDFILE" ]] && oldpid=$(<"$PIDFILE")
-    if [[ -n "$oldpid" ]] && ! kill -0 "$oldpid" 2>/dev/null; then
-      # Stale lock: best-effort cleanup
-      rm -f "$PIDFILE" 2>/dev/null || true
-      rmdir "$LOCKDIR" 2>/dev/null || true
-      # Try once more
-      if mkdir "$LOCKDIR" 2>/dev/null; then
-        print -r -- "$$" >| "$PIDFILE" 2>/dev/null || true
-        return 0
-      fi
-    fi
-  fi
-
-  print -r -- "Another updatett instance appears to be running. Exiting."
-  exit 1
-}
-
-ensure_lock
-
-# TTY detection
-IS_TTY=1
-[[ -t 1 ]] || IS_TTY=0
-
-# Colors & symbols (TTY-aware; raw escapes for printf, NOT prompt %{})
-if [[ "$IS_TTY" -eq 1 && -z "${NO_COLOR:-}" ]]; then
-  BLUE=$'\033[0;34m'
-  GREEN=$'\033[0;32m'
-  YELLOW=$'\033[1;33m'
-  RED=$'\033[0;31m'
-  GRAY=$'\033[90m'
-  DIM=$'\033[2m'
-  BOLD=$'\033[1m'
-  NC=$'\033[0m'
-else
-  BLUE=""; GREEN=""; YELLOW=""; RED=""; GRAY=""; DIM=""; BOLD=""; NC=""
+# Kernel locks disappear on exit, including crashes. Keep the empty lock file:
+# unlinking it would allow another process to lock a different inode.
+zmodload zsh/system || exit 1
+lock_file="${TMPDIR:-/tmp}/updatett-${UID}.lock"
+[[ ! -L "$lock_file" ]] && (umask 077; : >> "$lock_file") || exit 1
+if ! zsystem flock -t 0 "$lock_file" 2>/dev/null; then
+    print -ru2 -- 'Another updatett instance is running, or the lock is unavailable.'
+    exit 1
 fi
 
-# Symbols
-CHECK="✓"
-CROSS="✗"
-SKIP="○"
-ARROW="→"
+worker_pid=''
+temp_dir=''
+op_target=''
+typeset -a stopped_pids=()
 
-# Spinner frames
-SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-
-# Create secure temp directory
-TEMP_DIR=$(mktemp -d "${TMPDIR}/updatett.XXXXXXXXXX") || {
-    print -r -- "${RED}Failed to create temporary directory${NC}" >&2
-    # Ensure lock is removed if mktemp fails
-    rm -f "$PIDFILE" 2>/dev/null || true
-    rmdir "$LOCKDIR" 2>/dev/null || true
-    exit 1
+# Freeze parents before finding children so installers cannot spawn more work
+# while cancellation walks the process tree.
+stop_tree() {
+    local child
+    kill -STOP "$1" 2>/dev/null || return 0
+    stopped_pids+=("$1")
+    for child in ${(f)"$(pgrep -P "$1" 2>/dev/null)"}; do
+        [[ -n "$child" ]] && stop_tree "$child"
+    done
 }
 
-# Track updater child PIDs so we can terminate on signals
-typeset -ag UPDATER_PIDS=()
-
-# Cleanup function
 cleanup() {
-    # If signaled, prefer signal-coded exit statuses
-    local code="${EXIT_CODE_OVERRIDE:-$?}"
-
-    # Kill spinner if running
-    if [[ -n "${spinner_pid:-}" ]] && kill -0 "$spinner_pid" 2>/dev/null; then
-        kill "$spinner_pid" 2>/dev/null || true
-        wait "$spinner_pid" 2>/dev/null || true
+    local code=$?
+    trap - INT TERM EXIT
+    if [[ -n "$worker_pid" ]]; then
+        stop_tree "$worker_pid"
+        if (( ${#stopped_pids} )); then
+            kill -TERM "${stopped_pids[@]}" 2>/dev/null || true
+            kill -CONT "${stopped_pids[@]}" 2>/dev/null || true
+            sleep 0.2
+            kill -KILL "${stopped_pids[@]}" 2>/dev/null || true
+        fi
+        wait "$worker_pid" 2>/dev/null || true
     fi
-
-    # Terminate any in-flight updater children
-    if (( ${#UPDATER_PIDS[@]} )); then
-        for pid in "${UPDATER_PIDS[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                kill "$pid" 2>/dev/null || true
-            fi
-        done
-        # Give them a brief moment, then force kill if needed
-        sleep 0.2
-        for pid in "${UPDATER_PIDS[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                kill -9 "$pid" 2>/dev/null || true
-            fi
-        done
+    if [[ -n "$temp_dir" ]]; then
+        if [[ -f "$temp_dir/installing" ]]; then
+            cp -p "$temp_dir/previous-op" "$op_target" 2>/dev/null || print -ru2 -- 'Could not restore the previous 1Password CLI.'
+        fi
+        rm -rf -- "$temp_dir"
     fi
-
-    # Remove temp directory
-    if [[ -n "${TEMP_DIR:-}" && "${TEMP_DIR}" != "/" && -d "$TEMP_DIR" ]]; then
-        rm -rf "$TEMP_DIR"
-    fi
-
-    # Remove lock directory
-    rm -f "$PIDFILE" 2>/dev/null || true
-    rmdir "$LOCKDIR" 2>/dev/null || true
-
-    # If we're exiting with an error, show message
-    if [[ "$code" -ne 0 ]]; then
-        print -ru2 -- ""
-        print -ru2 -- "${RED}Script terminated with error (exit code: $code)${NC}"
-    fi
-
-    exit "$code"
+    return "$code"
 }
-
-# Set up traps with explicit signal mapping
-trap 'EXIT_CODE_OVERRIDE=$((128+2)); cleanup' INT
-trap 'EXIT_CODE_OVERRIDE=$((128+15)); cleanup' TERM
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap 'cleanup' EXIT
 
-# ═══════════════════════════════════════════════════════════════
-# TOOLS CONFIGURATION
-# Format: "Display Name|check_command|version_command|update_command"
-# Use CHECK_ONLY:<checker> for tools that can report latest status but need manual updates.
-# ═══════════════════════════════════════════════════════════════
+# Wrangler belongs to the default nvm environment, not whichever Node happens
+# to be newest. Native CLIs and uv tools take precedence over app-bundled tools.
+node_ready=1
+export NVM_DIR="${NVM_DIR:-${XDG_CONFIG_HOME:+$XDG_CONFIG_HOME/nvm}}"
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [[ -s "$NVM_DIR/nvm.sh" ]]; then
+    source "$NVM_DIR/nvm.sh" --no-use && nvm use default --silent >/dev/null 2>&1 || node_ready=0
+fi
+export PATH="$HOME/.local/bin:$PATH"
+# Wrangler writes debug files even for --version unless explicitly disabled.
+export WRANGLER_WRITE_LOGS=0
 
-TOOLS=(
-    "uv|uv|uv --version|uv self update"
-    "Claude CLI|claude|claude --version|claude update"
-    "1Password CLI|op|op --version|CHECK_ONLY:1password-cli"
-    "OpenAI Codex|SKIP_CHECK|npm list -g @openai/codex|npm install -g @openai/codex@latest"
-    "Wrangler|wrangler|wrangler --version|npm install -g wrangler@latest"
-    "Pyright|pyright|pyright --version|npm install -g pyright@latest"
-    "TypeScript LS|typescript-language-server|typescript-language-server --version|npm install -g typescript-language-server@latest typescript@latest"
-)
+is_tty=0
+[[ -t 1 ]] && is_tty=1
+green='' red='' yellow='' dim='' reset=''
+if (( is_tty )) && [[ -z "${NO_COLOR:-}" ]]; then
+    green=$'\e[32m'; red=$'\e[31m'; yellow=$'\e[33m'
+    dim=$'\e[2m'; reset=$'\e[0m'
+fi
+frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+row=''
+failures=0
 
-# ═══════════════════════════════════════════════════════════════
-
-# Global spinner PID
-spinner_pid=""
-
-# Spinner function
-spin() {
-    local pid=$1
-    local delay=0.1
-    local frame=1
-    local num_frames=${#SPINNER_FRAMES[@]}
-
-    # Only show spinner if TTY
-    if [[ "$IS_TTY" -ne 1 ]]; then
-        while kill -0 "$pid" 2>/dev/null; do
-            sleep $delay
-        done
-        return
-    fi
-
-    while kill -0 "$pid" 2>/dev/null; do
-        printf "\r${DIM}[%d/%d]${NC} %-20s ${DIM}%s${NC} ${YELLOW}%s${NC} " \
-            "$current_index" "$total" "$current_name" "$current_version" "${SPINNER_FRAMES[$frame]}"
-        frame=$(( (frame % num_frames) + 1 ))
-        sleep $delay
-    done
-}
-
-# Clean version extraction
-get_version() {
-    local cmd=$1
-
-    # Special handling for npm list commands
-    if [[ $cmd == *"npm list -g @openai/codex"* ]]; then
-        local version
-        version=$(npm list -g --depth=0 @openai/codex 2>/dev/null | grep '@openai/codex@' | grep -Eo '[0-9]+(\.[0-9]+){1,3}(-[A-Za-z0-9._-]+)?' | head -n1)
-        print -r -- "$version"
-        return
-    fi
-
-    # Regular extraction for other commands
+version() {
     local output
-    local -a argv; argv=("${(z)cmd}")
-    if command -v "${argv[1]}" >/dev/null 2>&1; then
-        output="$("${argv[@]}" 2>/dev/null | head -n1)" || output=""
+    output=$("$1" --version 2>/dev/null) || return 1
+    if [[ "$output" =~ '([0-9]+\.[0-9]+\.[0-9]+([-+][[:alnum:]._-]+)?)' ]]; then
+        print -r -- "$match[1]"
     else
-        output=""
-    fi
-
-    local version
-    version=$(print -r -- "$output" | grep -Eo '[0-9]+(\.[0-9]+){1,3}(-[A-Za-z0-9._-]+)?' | head -n1)
-    if [[ -n "$version" ]]; then
-        print -r -- "$version"
-    elif [[ -n "$output" ]] && [[ ${#output} -lt 64 ]]; then
-        print -r -- "$output"
+        return 1
     fi
 }
 
-get_latest_1password_cli_version() {
-    local channel="${1:-stable}"
-    local url="https://app-updates.agilebits.com/product_history/CLI2"
-    local page
-
-    command -v curl >/dev/null 2>&1 || return 1
-    page=$(curl -fsSL "$url" 2>/dev/null) || return 1
-
-    awk -v channel="$channel" '
-        /<article / {
-            in_article = 1
-            is_beta = ($0 ~ /class=.beta/)
-            next
-        }
-        in_article && /<\/article>/ {
-            in_article = 0
-            is_beta = 0
-            next
-        }
-        in_article && ((channel == "beta" && is_beta) || (channel != "beta" && !is_beta)) && /^[[:space:]]*[0-9]+(\.[0-9]+){2,3}(-[A-Za-z0-9._-]+)?[[:space:]]*$/ {
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
-            print
-            exit
-        }
-    ' <<< "$page"
+run_quiet() {
+    local result=0 frame=1
+    "$@" </dev/null >/dev/null 2>&1 &
+    worker_pid=$!
+    if (( is_tty )); then
+        while kill -0 "$worker_pid" 2>/dev/null; do
+            printf '\r\033[2K%s %s' "$row" "${frames[frame]}"
+            frame=$((frame % ${#frames} + 1))
+            sleep 0.1
+        done
+    fi
+    wait "$worker_pid" 2>/dev/null || result=$?
+    worker_pid=''
+    (( ! is_tty )) || printf '\r\033[2K'
+    return "$result"
 }
 
-get_latest_version() {
-    local checker=$1
-
-    case "$checker" in
-        1password-cli)
-            get_latest_1password_cli_version stable
-            ;;
-        1password-cli-beta)
-            get_latest_1password_cli_version beta
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-compare_versions() {
-    local left="$1"
-    local right="$2"
-    local left_base="${left%%-*}"
-    local right_base="${right%%-*}"
-    local left_pre=""
-    local right_pre=""
-    local -a left_parts right_parts left_pre_parts right_pre_parts
-    local max i left_part right_part
-    local left_is_number right_is_number
-
-    [[ "$left" == *-* ]] && left_pre="${left#*-}"
-    [[ "$right" == *-* ]] && right_pre="${right#*-}"
-
-    left_parts=("${(@s:.:)left_base}")
-    right_parts=("${(@s:.:)right_base}")
-    max=${#left_parts[@]}
-    (( ${#right_parts[@]} > max )) && max=${#right_parts[@]}
-
-    for ((i = 1; i <= max; i++)); do
-        left_part="${left_parts[i]:-0}"
-        right_part="${right_parts[i]:-0}"
-        [[ "$left_part" == <-> ]] || left_part=0
-        [[ "$right_part" == <-> ]] || right_part=0
-
-        if (( left_part > right_part )); then
-            print -r -- "1"
-            return 0
-        elif (( left_part < right_part )); then
-            print -r -- "-1"
-            return 0
-        fi
-    done
-
-    if [[ -z "$left_pre" && -z "$right_pre" ]]; then
-        print -r -- "0"
-        return 0
-    elif [[ -z "$left_pre" ]]; then
-        print -r -- "1"
-        return 0
-    elif [[ -z "$right_pre" ]]; then
-        print -r -- "-1"
-        return 0
-    fi
-
-    left_pre_parts=("${(@s:.:)left_pre}")
-    right_pre_parts=("${(@s:.:)right_pre}")
-    max=${#left_pre_parts[@]}
-    (( ${#right_pre_parts[@]} > max )) && max=${#right_pre_parts[@]}
-
-    for ((i = 1; i <= max; i++)); do
-        left_part="${left_pre_parts[i]:-}"
-        right_part="${right_pre_parts[i]:-}"
-
-        if [[ -z "$left_part" && -n "$right_part" ]]; then
-            print -r -- "-1"
-            return 0
-        elif [[ -n "$left_part" && -z "$right_part" ]]; then
-            print -r -- "1"
-            return 0
-        fi
-
-        left_is_number=0
-        right_is_number=0
-        [[ "$left_part" == <-> ]] && left_is_number=1
-        [[ "$right_part" == <-> ]] && right_is_number=1
-
-        if (( left_is_number && right_is_number )); then
-            if (( 10#$left_part > 10#$right_part )); then
-                print -r -- "1"
-                return 0
-            elif (( 10#$left_part < 10#$right_part )); then
-                print -r -- "-1"
-                return 0
-            fi
-        elif (( left_is_number )); then
-            print -r -- "-1"
-            return 0
-        elif (( right_is_number )); then
-            print -r -- "1"
-            return 0
-        elif [[ "$left_part" > "$right_part" ]]; then
-            print -r -- "1"
-            return 0
-        elif [[ "$left_part" < "$right_part" ]]; then
-            print -r -- "-1"
-            return 0
-        fi
-    done
-
-    print -r -- "0"
-}
-
-check_latest_only() {
-    local checker=$1
-    local current_version=$2
-    local latest_version compare_result selected_checker status_scope
-
-    selected_checker="$checker"
-    status_scope=""
-    if [[ "$checker" == "1password-cli" && "$current_version" == *-* ]]; then
-        selected_checker="1password-cli-beta"
-        status_scope=" beta"
-    fi
-
-    latest_version=$(get_latest_version "$selected_checker") || latest_version=""
-    if [[ -z "$latest_version" ]]; then
-        printf "${YELLOW}${SKIP}${NC} ${DIM}(latest check unavailable)${NC}\n"
-        return 0
-    fi
-
-    if [[ -z "$current_version" ]]; then
-        printf "${ARROW} ${YELLOW}%s${NC} ${YELLOW}${SKIP}${NC} ${DIM}(installed version unknown)${NC}\n" "$latest_version"
-        return 0
-    fi
-
-    compare_result=$(compare_versions "$current_version" "$latest_version")
-    case "$compare_result" in
-        0)
-            printf "${GREEN}${CHECK}${NC} ${DIM}(already latest%s)${NC}\n" "$status_scope"
-            ;;
-        -1)
-            printf "${ARROW} ${YELLOW}%s${NC} ${YELLOW}${SKIP}${NC} ${DIM}(manual%s update required)${NC}\n" "$latest_version" "$status_scope"
-            ;;
-        1)
-            printf "${GREEN}${CHECK}${NC} ${DIM}(newer than latest%s listed: %s)${NC}\n" "$status_scope" "$latest_version"
-            ;;
-    esac
-}
-
-# Update a single tool
 update_tool() {
-    local tool_spec=$1
-    local index=$2
-
-    IFS='|' read -r name check_cmd version_cmd update_cmd <<< "$tool_spec"
-    current_index=$index
-    current_name="$name"
-
-    # Create unique temp files for this tool
-    local log_file="${TEMP_DIR}/tool_${index}.log"
-    local status_file="${TEMP_DIR}/tool_${index}.status"
-
-    # Initial status line
-    printf "${DIM}[%d/%d]${NC} %-20s " "$current_index" "$total" "$name"
-
-    # Check if command exists (unless it's an npm package without CLI)
-    if [[ "$check_cmd" != "SKIP_CHECK" ]]; then
-        if ! command -v "$check_cmd" &> /dev/null; then
-            printf "${GRAY}${SKIP} not installed${NC} ${DIM}(${check_cmd} not found)${NC}\n"
-            return 0
-        fi
-    fi
-
-    # Get current version
-    current_version=$(get_version "$version_cmd")
-    if [[ -n "$current_version" ]]; then
-        printf "${DIM}%s${NC} " "$current_version"
-    fi
-
-    if [[ "$update_cmd" == CHECK_ONLY:* ]]; then
-        check_latest_only "${update_cmd#CHECK_ONLY:}" "$current_version"
+    local name=$1 binary=$2 before after code
+    shift 2
+    if ! command -v "$binary" >/dev/null 2>&1; then
+        printf '%-18s %s✗ missing (%s)%s\n' "$name" "$red" "$binary" "$reset"
+        (( failures++ ))
         return 0
     fi
-
-    # Run update with spinner (per-tool error handling) using safe parsing
-    {
-        local -a argv; argv=("${(z)update_cmd}")
-        "${argv[@]}" &> "$log_file"
-        print -r -- "$?" >| "$status_file"
-    } &
-    local update_pid=$!
-    UPDATER_PIDS+=("$update_pid")
-
-    # Start spinner in background (TTY-aware)
-    spin $update_pid &
-    spinner_pid=$!
-
-    # Wait for update to complete
-    wait $update_pid 2>/dev/null || true
-
-    # Stop spinner
-    if [[ -n "$spinner_pid" ]] && kill -0 "$spinner_pid" 2>/dev/null; then
-        kill "$spinner_pid" 2>/dev/null || true
-        wait "$spinner_pid" 2>/dev/null || true
-    fi
-    spinner_pid=""
-
-    # Remove finished pid from tracking
-    for i in {1..${#UPDATER_PIDS[@]}}; do
-        if [[ "${UPDATER_PIDS[i]}" == "$update_pid" ]]; then
-            unset "UPDATER_PIDS[i]"
-            break
-        fi
-    done
-
-    # Check result
-    local exit_code
-    if [[ -f "$status_file" ]]; then
-        exit_code=$(<"$status_file")
-    else
-        exit_code=1
-    fi
-
-    # Clear spinner line (TTY-aware)
-    if [[ "$IS_TTY" -eq 1 ]]; then
-        printf "\r"
-    fi
-    printf "${DIM}[%d/%d]${NC} %-20s " "$current_index" "$total" "$name"
-
-    if [[ "$exit_code" == "0" ]]; then
-        # Get new version after update
-        local new_version=$(get_version "$version_cmd")
-
-        if [[ -n "$current_version" && -n "$new_version" ]]; then
-            if [[ "$current_version" == "$new_version" ]]; then
-                printf "${DIM}%s${NC} ${GREEN}${CHECK}${NC} ${DIM}(already latest)${NC}\n" "$current_version"
-            else
-                printf "${DIM}%s${NC} ${ARROW} ${GREEN}%s${NC} ${GREEN}${CHECK}${NC}\n" "$current_version" "$new_version"
-            fi
-        elif [[ -n "$new_version" ]]; then
-            printf "${ARROW} ${GREEN}%s${NC} ${GREEN}${CHECK}${NC}\n" "$new_version"
+    before=$(version "$binary") || before='unknown'
+    row=$(printf '%-18s %s' "$name" "$before")
+    if [[ "$binary" == wrangler && "$node_ready" == 0 ]]; then
+        printf '%s %s✗ default Node unavailable%s\n' "$row" "$red" "$reset"
+        (( failures++ ))
+    elif run_quiet "$@"; then
+        after=$(version "$binary") || after=''
+        if [[ -z "$after" ]]; then
+            printf '%s %s✗ version check failed%s\n' "$row" "$red" "$reset"
+            (( failures++ ))
+        elif [[ "$before" == "$after" ]]; then
+            printf '%s %s✓%s %s(unchanged)%s\n' "$row" "$green" "$reset" "$dim" "$reset"
         else
-            printf "${ARROW} ${GREEN}${CHECK}${NC} ${DIM}(updated)${NC}\n"
+            printf '%s → %s%s ✓%s\n' "$row" "$green" "$after" "$reset"
         fi
     else
-        printf "${DIM}%s${NC} ${ARROW} ${RED}${CROSS}${NC}" "$current_version"
-
-        if [[ -f "$log_file" ]]; then
-            local error
-            error=$(grep -Eim1 'error|failed|permission' "$log_file" 2>/dev/null)
-            if [[ -n "$error" ]]; then
-                error="${error:0:80}"
-                printf " ${DIM}${RED}(%s...)${NC}" "$error"
-            else
-                printf " ${DIM}${RED}(update failed)${NC}"
-            fi
-        else
-            printf " ${DIM}${RED}(update failed)${NC}"
-        fi
-        printf "\n"
+        code=$?
+        printf '%s %s✗ update failed (exit %s)%s\n' "$row" "$red" "$code" "$reset"
+        (( failures++ ))
     fi
+    return 0
 }
 
-# Main
-main() {
-    if [[ "$IS_TTY" -eq 1 ]]; then
-        command -v clear >/dev/null 2>&1 && clear
-    fi
-
-    print -r -- ""
-    print -r -- "${BOLD}${BLUE}updatett${NC} ${DIM}• Terminal Tools Updater${NC}"
-    print -r -- "${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    print -r -- ""
-
-    total=${#TOOLS[@]}
-    local index=1
-
-    # Process all tools
-    for tool in "${TOOLS[@]}"; do
-        update_tool "$tool" "$index"
-        ((index++))
+install_1password() {
+    local before channel=stable candidate expected pid attempt
+    local -a packages downloads active daemons
+    before=$(version "$op_target") || return 1
+    [[ "$before" != *-* ]] || channel=beta
+    "$op_target" update --channel "$channel" --directory "$temp_dir" || return 1
+    downloads=("$temp_dir"/*(N))
+    (( ${#downloads} )) || return 0
+    packages=("$temp_dir"/*.pkg(N))
+    (( ${#packages} == 1 )) || return 1
+    pkgutil --check-signature "$packages[1]" || return 1
+    pkgutil --expand-full "$packages[1]" "$temp_dir/unpacked" || return 1
+    candidate="$temp_dir/unpacked/op.pkg/Payload/op"
+    local requirement='anchor apple generic and identifier "com.1password.op" and certificate leaf[subject.OU] = "2BUA8C4S2C"'
+    codesign --verify --strict -R="$requirement" "$candidate" || return 1
+    expected=$(version "$candidate") || return 1
+    [[ -f "$op_target" && ! -L "$op_target" && -w "$op_target" ]] || return 1
+    # Only stop the auto-restarted cache daemon; leave active CLI work alone.
+    active=(${(f)"$(pgrep -u "$UID" -x op)"})
+    daemons=(${(f)"$(pgrep -u "$UID" -f '^([^[:space:]]*/)?op daemon([[:space:]]|$)')"})
+    for pid in "${active[@]}"; do
+        (( ${daemons[(Ie)$pid]} )) || return 1
     done
-
-    print -r -- ""
-    print -r -- "${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    print -r -- ""
+    if (( ${#daemons} )); then
+        kill -TERM "${daemons[@]}" || return 1
+        for attempt in {1..10}; do
+            pgrep -u "$UID" -x op >/dev/null || break
+            sleep 0.1
+        done
+    fi
+    pgrep -u "$UID" -x op >/dev/null && return 1
+    cp -p "$op_target" "$temp_dir/previous-op" || return 1
+    # The EXIT trap restores this backup on failure or cancellation. Copying
+    # over the user-owned file preserves the required /usr/local/bin location.
+    : > "$temp_dir/installing"
+    cp "$candidate" "$op_target" || return 1
+    codesign --verify --strict -R="$requirement" "$op_target" || return 1
+    [[ "$(version "$op_target")" == "$expected" ]] || return 1
+    rm "$temp_dir/installing"
 }
 
-# Run main function
-main
+print -r -- $'\nupdatett • Global Terminal Tools\n'
+update_tool uv uv env UV_NO_MODIFY_PATH=1 uv self update
+update_tool Ruff ruff uv tool upgrade ruff
+update_tool ty ty uv tool upgrade ty
+update_tool 'Claude CLI' claude claude update
+update_tool 'OpenAI Codex' codex codex update
+update_tool Wrangler wrangler npm install -g wrangler@latest --allow-scripts=esbuild,workerd,fsevents --strict-allow-scripts --logs-max=0 --no-fund
+op_target=$(command -v op) || op_target=''
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/updatett-op.XXXXXXXX") || exit 1
+update_tool '1Password CLI' op install_1password
+print
+(( ! failures )) || print -r -- "$failures tool(s) failed."
+exit $(( failures > 0 ))
