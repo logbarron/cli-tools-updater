@@ -1,17 +1,17 @@
 """Exercise the updater using isolated fake executables, never installed tools."""
+
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-
+from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1] / "updatett"
-MOCK = r'''
+MOCK = r"""
 import json, os, subprocess, sys, time
 from pathlib import Path
 name = Path(sys.argv[0]).name
@@ -71,7 +71,7 @@ if name == 'op':
         (dest / 'op.pkg').write_text('fake package')
 elif os.environ.get('TEST_UNCHANGED') != '1':
     (root / ('version-' + ('wrangler' if name == 'npm' else target))).write_text('1.1.0')
-'''
+"""
 
 
 class UpdaterTests(unittest.TestCase):
@@ -80,7 +80,19 @@ class UpdaterTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ["uv", "ruff", "ty", "claude", "codex", "wrangler", "npm", "op", "pkgutil", "codesign", "pgrep"]:
+        for name in [
+            "uv",
+            "ruff",
+            "ty",
+            "claude",
+            "codex",
+            "wrangler",
+            "npm",
+            "op",
+            "pkgutil",
+            "codesign",
+            "pgrep",
+        ]:
             executable = self.bin / name
             executable.write_text("#!" + sys.executable + "\n" + MOCK)
             executable.chmod(0o755)
@@ -91,9 +103,13 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(source.count(prepend), 1)
         self.script = self.root / "updatett"
         self.script.write_text(source.replace(prepend, ""))
-        self.env = dict(os.environ, PATH=str(self.bin) + ":/usr/bin:/bin",
-                        TMPDIR=str(self.root), NVM_DIR=str(self.root / "nvm"),
-                        TEST_ROOT=str(self.root))
+        self.env = dict(
+            os.environ,
+            PATH=str(self.bin) + ":/usr/bin:/bin",
+            TMPDIR=str(self.root),
+            NVM_DIR=str(self.root / "nvm"),
+            TEST_ROOT=str(self.root),
+        )
         self.process = None
 
     def tearDown(self):
@@ -106,20 +122,31 @@ class UpdaterTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_updater(self, **settings):
-        return subprocess.run(["/bin/zsh", "-f", str(self.script)],
-                              env=dict(self.env, **settings), capture_output=True,
-                              text=True, timeout=10)
+        return subprocess.run(
+            ["/bin/zsh", "-f", str(self.script)],
+            check=False,
+            env=dict(self.env, **settings),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
 
     def calls(self):
-        return [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+        return [
+            json.loads(line) for line in (self.root / "calls").read_text().splitlines()
+        ]
 
     def start_blocked(self):
-        self.process = subprocess.Popen(["/bin/zsh", "-f", str(self.script)],
-            env=dict(self.env, TEST_BLOCK="uv"), stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True)
+        self.process = subprocess.Popen(
+            ["/bin/zsh", "-f", str(self.script)],
+            env=dict(self.env, TEST_BLOCK="uv"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         deadline = time.monotonic() + 5
         while not (self.root / "worker").exists() and time.monotonic() < deadline:
-            time.sleep(.02)
+            time.sleep(0.02)
         return json.loads((self.root / "worker").read_text())
 
     def test_updates_and_no_logs_or_duplicate_rows(self):
@@ -159,51 +186,61 @@ class UpdaterTests(unittest.TestCase):
         self.assertNotIn("already latest", result.stdout)
 
     def test_beta_download_is_verified_installed_and_removed(self):
-        result = self.run_updater(TEST_OP_VERSION="2.42.0-beta.01", TEST_NEXT_OP_VERSION="2.42.0-beta.02", TEST_OP_DOWNLOAD="1")
+        result = self.run_updater(
+            TEST_OP_VERSION="2.42.0-beta.01",
+            TEST_NEXT_OP_VERSION="2.42.0-beta.02",
+            TEST_OP_DOWNLOAD="1",
+        )
         self.assertEqual(result.returncode, 0)
         self.assertIn("2.42.0-beta.01 → 2.42.0-beta.02", result.stdout)
         op = next(call for call in self.calls() if call[0] == "op")
         self.assertEqual(op[1:4], ["update", "--channel", "beta"])
         verification = [call for call in self.calls() if call[0] == "codesign"]
         self.assertEqual(len(verification), 2)
-        self.assertTrue(all('2BUA8C4S2C' in call[3] for call in verification))
+        self.assertTrue(all("2BUA8C4S2C" in call[3] for call in verification))
         self.assertFalse(list(self.root.glob("updatett-op.*")))
 
     def test_rejected_packages_and_busy_binary_are_not_installed(self):
         original = (self.bin / "op").read_bytes()
-        for setting in ['TEST_BAD_PACKAGE', 'TEST_BAD_SIGNATURE', 'TEST_OP_IN_USE']:
+        for setting in ["TEST_BAD_PACKAGE", "TEST_BAD_SIGNATURE", "TEST_OP_IN_USE"]:
             with self.subTest(setting=setting):
-                result = self.run_updater(**{setting: '1', 'TEST_OP_DOWNLOAD': '1'})
+                result = self.run_updater(**{setting: "1", "TEST_OP_DOWNLOAD": "1"})
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual((self.bin / "op").read_bytes(), original)
                 self.assertFalse(list(self.root.glob("updatett-op.*")))
 
     def test_failed_installed_verification_restores_previous_binary(self):
         original = (self.bin / "op").read_bytes()
-        result = self.run_updater(TEST_OP_DOWNLOAD='1', TEST_FAIL_INSTALLED_VERIFY='1')
+        result = self.run_updater(TEST_OP_DOWNLOAD="1", TEST_FAIL_INSTALLED_VERIFY="1")
         self.assertEqual(result.returncode, 1)
         self.assertEqual((self.bin / "op").read_bytes(), original)
         self.assertFalse(list(self.root.glob("updatett-op.*")))
 
     def test_cancelled_install_restores_previous_binary_and_cleans_download(self):
         original = (self.bin / "op").read_bytes()
-        self.process = subprocess.Popen(["/bin/zsh", "-f", str(self.script)],
-            env=dict(self.env, TEST_OP_DOWNLOAD='1', TEST_BLOCK_INSTALLED_VERIFY='1'),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.process = subprocess.Popen(
+            ["/bin/zsh", "-f", str(self.script)],
+            env=dict(self.env, TEST_OP_DOWNLOAD="1", TEST_BLOCK_INSTALLED_VERIFY="1"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         deadline = time.monotonic() + 5
-        while not (self.root / 'worker').exists() and time.monotonic() < deadline:
-            time.sleep(.02)
-        self.assertTrue((self.root / 'worker').exists())
-        self.assertNotEqual((self.bin / 'op').read_bytes(), original)
+        while not (self.root / "worker").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue((self.root / "worker").exists())
+        self.assertNotEqual((self.bin / "op").read_bytes(), original)
         self.process.send_signal(signal.SIGTERM)
         self.assertEqual(self.process.wait(timeout=5), 143)
-        self.assertEqual((self.bin / 'op').read_bytes(), original)
-        self.assertFalse(list(self.root.glob('updatett-op.*')))
+        self.assertEqual((self.bin / "op").read_bytes(), original)
+        self.assertFalse(list(self.root.glob("updatett-op.*")))
 
     def test_default_nvm_failure_does_not_use_inherited_npm(self):
         nvm = self.root / "nvm"
         nvm.mkdir()
-        (nvm / "nvm.sh").write_text('nvm() { [[ "$1 $2" == "use default" ]] && return 3; }\n')
+        (nvm / "nvm.sh").write_text(
+            'nvm() { [[ "$1 $2" == "use default" ]] && return 3; }\n'
+        )
         result = self.run_updater()
         self.assertEqual(result.returncode, 1)
         self.assertIn("default Node unavailable", result.stdout)
@@ -214,6 +251,7 @@ class UpdaterTests(unittest.TestCase):
         result = self.run_updater()
         self.assertEqual(result.returncode, 1)
         self.assertIn("Another updatett", result.stderr)
+        assert self.process is not None
         os.killpg(self.process.pid, signal.SIGKILL)
         self.process.wait()
         self.assertEqual(self.run_updater().returncode, 0)
@@ -223,11 +261,16 @@ class UpdaterTests(unittest.TestCase):
             with self.subTest(signal=sig):
                 (self.root / "worker").unlink(missing_ok=True)
                 pids = self.start_blocked()
+                assert self.process is not None
                 self.process.send_signal(sig)
                 self.assertEqual(self.process.wait(timeout=5), 128 + sig)
                 for pid in pids:
-                    status = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)],
-                                            capture_output=True, text=True).stdout.strip()
+                    status = subprocess.run(
+                        ["/bin/ps", "-o", "stat=", "-p", str(pid)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
                     self.assertTrue(not status or status.startswith("Z"), (pid, status))
                 self.assertEqual(self.run_updater().returncode, 0)
 

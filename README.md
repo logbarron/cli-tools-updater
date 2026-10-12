@@ -74,7 +74,13 @@ rm /usr/local/bin/updatett
 
 ```sh
 zsh -n updatett
-python3 tests/test_updatett.py
+uv run --python 3.14 tests/test_updatett.py
+ruff check --no-cache tests
+ruff format --check --no-cache tests
+ty check tests
 ```
 
 The tests use fake tools and temporary directories; they never update installed software.
+They use only Python's standard library. uv runs them with Python 3.14; the global
+Ruff and ty tools check their style and types. No project environment or third-party
+Python dependencies are needed. Python is used only for verification, not by the updater.
