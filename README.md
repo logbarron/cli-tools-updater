@@ -5,6 +5,8 @@ before/after versions, continues after individual failures, and returns a
 nonzero exit status when any tool fails. No update logs are written or kept.
 Wrangler's own debug-file logging and npm's debug logs are disabled for this run.
 
+![updatett demo](assets/updatett-demo.gif)
+
 ## Tools
 
 | Tool | Update command |
